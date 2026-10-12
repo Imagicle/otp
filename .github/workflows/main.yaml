@@ -265,6 +265,9 @@ jobs:
       run:
         shell: wsl-bash {0}
     env:
+      # Published by https://github.com/slproweb/opensslhashes.
+      OPENSSL_SHA256: 5fe338c81d62515df7292f16542a0eef2a29db3efc023cd5a8c08ec3c97027ae
+      OPENSSL_VERSION: 3.5.9
       WXWIDGETS_VERSION: 3.2.6
     name: Build Erlang/OTP (Windows)
     runs-on: windows-2025
@@ -285,11 +288,47 @@ jobs:
         run: |
           choco install nsis --version 3.11.0
 
+      - name: Restore OpenSSL cache
+        id: openssl-cache
+        uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: C:\OpenSSL-Win64
+          key: windows-openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-${{ runner.arch }}
+
       - name: Install openssl
-        shell: cmd
+        shell: powershell
         run: |
-          choco install openssl --version=3.1.1
-          IF EXIST "c:\\Program Files\\OpenSSL-Win64" (move "c:\\Program Files\\OpenSSL-Win64" "c:\\OpenSSL-Win64") ELSE (move "c:\\Program Files\\OpenSSL" "c:\\OpenSSL-Win64")
+          $marker = "C:\OpenSSL-Win64\.otp-ci-$($env:OPENSSL_SHA256)"
+          if (!(Test-Path $marker)) {
+            $version = $env:OPENSSL_VERSION.Replace('.', '_')
+            $installer = Join-Path $env:RUNNER_TEMP "Win64OpenSSL-$version.exe"
+            Invoke-WebRequest "https://slproweb.com/download/Win64OpenSSL-$version.exe" -OutFile $installer
+            $actualHash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $env:OPENSSL_SHA256) {
+              throw "OpenSSL installer hash mismatch: $actualHash"
+            }
+            Remove-Item C:\OpenSSL-Win64 -Recurse -Force -ErrorAction SilentlyContinue
+            $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/DIR=C:\OpenSSL-Win64')
+            $process = Start-Process $installer -ArgumentList $arguments -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+              throw "OpenSSL installer failed with exit code $($process.ExitCode)"
+            }
+            New-Item -ItemType File -Path $marker | Out-Null
+          }
+          $installedVersion = & C:\OpenSSL-Win64\bin\openssl.exe version
+          $expectedVersion = [regex]::Escape($env:OPENSSL_VERSION)
+          if ($installedVersion -notmatch "^OpenSSL $expectedVersion ") {
+            throw "Unexpected OpenSSL version: $installedVersion"
+          }
+          Get-Item C:\OpenSSL-Win64\include\openssl\opensslv.h | Out-Null
+          Get-Item C:\OpenSSL-Win64\lib\VC\x64\MD\libcrypto_static.lib | Out-Null
+
+      - name: Save OpenSSL cache
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: C:\OpenSSL-Win64
+          key: windows-openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-${{ runner.arch }}
 
       - name: Cache wxWidgets
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
@@ -347,8 +386,8 @@ jobs:
         env:
           WSLENV: GITHUB_OUTPUT/p
         run: |
-          mkdir -p /mnt/c/opt/local64/pgm/
-          cp -R wxWidgets /mnt/c/opt/local64/pgm/wxWidgets-${{ env.WXWIDGETS_VERSION }}
+          set -x
+          WXDIR="$PWD/wxWidgets"
           tar -xzf ./otp_src.tar.gz
           cd otp
           export PATH="/mnt/c/Program Files (x86)/NSIS/bin":$PATH
@@ -357,16 +396,36 @@ jobs:
           export ERLC_USE_SERVER=true
           export ERTS_SKIP_DEPEND=true
           eval `./otp_build env_win32 x64`
-          ./otp_build configure
+          ./otp_build configure --with-wxdir="$WXDIR" \
+             --with-ssl=/mnt/c/OpenSSL-Win64 --disable-dynamic-ssl-lib
+          if test -f lib/crypto/CONF_INFO; then
+            CRYPTO_CONF_INFO=$(tr -d '\r\n' < lib/crypto/CONF_INFO)
+            EXPECTED_CRYPTO_CONF_INFO='Static linking with OpenSSL 3.0 *MAY* require special configuring of the cryptolib.'
+            if test "$CRYPTO_CONF_INFO" != "$EXPECTED_CRYPTO_CONF_INFO"; then
+              cat lib/crypto/CONF_INFO
+              exit 1
+            fi
+          fi
           if cat erts/CONF_INFO ||
-             grep -v "Static linking with OpenSSL 3.0" lib/*/CONF_INFO ||
+             find lib -mindepth 2 -maxdepth 2 -name CONF_INFO \
+                  ! -path lib/crypto/CONF_INFO -size +0 -exec cat {} + | grep . ||
              cat lib/*/SKIP ||
              cat lib/SKIP-APPLICATIONS; then
              exit 1
           fi
+          grep -E '^(DYNAMIC_CRYPTO_LIB|SSL_LIBDIR|SSL_CRYPTO_LIBNAME|CRYPTO_LINK_LIB)' lib/crypto/c_src/win32/Makefile
           ./otp_build boot -a
+          CRYPTO_DLL=lib/crypto/priv/lib/win32/crypto.dll
+          test -f "$CRYPTO_DLL"
+          x86_64-w64-mingw32-objdump -p "$CRYPTO_DLL" | grep 'DLL Name'
+          if x86_64-w64-mingw32-objdump -p "$CRYPTO_DLL" |
+             grep -iE 'DLL Name:.*(libcrypto|libssl)'; then
+             echo "crypto.dll unexpectedly depends on a dynamic OpenSSL library" >&2
+             exit 1
+          fi
+          ./bin/erl.exe -noshell -eval 'Info = crypto:info(), io:format("crypto:info() = ~p~n", [Info]), #{cryptolib_version_compiled := Version, cryptolib_version_linked := Version} = Info, halt().'
           ./otp_build release -a
-          cp /mnt/c/opt/local64/pgm/wxWidgets-${{ env.WXWIDGETS_VERSION }}/3rdparty/webview2/runtimes/win-x64/native/WebView2Loader.dll $ERL_TOP/release/win32/erts-*/bin/
+          cp "$WXDIR/3rdparty/webview2/runtimes/win-x64/native/WebView2Loader.dll" $ERL_TOP/release/win32/erts-*/bin/
           ./otp_build installer_win32
           echo "installer_name=$(ls release/win32/otp*.exe | xargs basename)" >> $GITHUB_OUTPUT
           make release_tests
@@ -384,11 +443,59 @@ jobs:
           name: otp_tests
           path: otp/tests.zip
 
-  test-windows:
-    name: Test Erlang/OTP (Windows)
+  build-wsl-openssl:
+    name: Build OpenSSL (WSL)
     runs-on: windows-2025
     needs: [pack, build-windows]
     if: needs.pack.outputs.changes != '[]' && !startsWith(github.ref, 'refs/tags/OTP-')
+    env:
+      OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+      OPENSSL_VERSION: 3.5.9
+      WSLENV: OPENSSL_SHA256:OPENSSL_VERSION
+    defaults:
+      run:
+        shell: wsl-bash {0}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: Vampire/setup-wsl@6a8db447be7ed35f2f499c02c6e60ff77ef11278 # v6.0.0
+        with:
+          distribution: Ubuntu-18.04
+
+      - name: Cache WSL OpenSSL
+        id: openssl-cache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: .cache/openssl-${{ env.OPENSSL_VERSION }}
+          key: wsl-openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build WSL OpenSSL
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        run: |
+          apt update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential curl perl
+          PREFIX="$PWD/.cache/openssl-${OPENSSL_VERSION}"
+          BUILD_DIR=$(mktemp -d)
+          trap 'rm -rf "$BUILD_DIR"' EXIT
+          ARCHIVE="openssl-${OPENSSL_VERSION}.tar.gz"
+          curl -fL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/${ARCHIVE}" -o "$BUILD_DIR/$ARCHIVE"
+          echo "${OPENSSL_SHA256}  $BUILD_DIR/$ARCHIVE" | sha256sum -c -
+          tar -xzf "$BUILD_DIR/$ARCHIVE" -C "$BUILD_DIR"
+          cd "$BUILD_DIR/openssl-${OPENSSL_VERSION}"
+          ./Configure linux-x86_64 no-shared \
+            --prefix="$PREFIX" --openssldir="$PREFIX/ssl"
+          make -j$(nproc)
+          make install_sw
+
+  test-windows:
+    name: Test Erlang/OTP (Windows)
+    runs-on: windows-2025
+    needs: [pack, build-windows, build-wsl-openssl]
+    if: needs.pack.outputs.changes != '[]' && !startsWith(github.ref, 'refs/tags/OTP-')
+    env:
+      OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+      OPENSSL_VERSION: 3.5.9
+      WSLENV: OPENSSL_SHA256:OPENSSL_VERSION
     defaults:
       run:
         shell: wsl-bash {0}
@@ -416,6 +523,34 @@ jobs:
       - name: Install WSL dependencies
         run: apt update && apt install -y make autoconf unzip zip
 
+      - name: Cache WSL OpenSSL
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: .cache/openssl-${{ env.OPENSSL_VERSION }}
+          key: wsl-openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build WSL OpenSSL
+        run: |
+          PREFIX="$PWD/.cache/openssl-${OPENSSL_VERSION}"
+          if [ ! -x "$PREFIX/bin/openssl" ]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential curl perl
+            BUILD_DIR=$(mktemp -d)
+            trap 'rm -rf "$BUILD_DIR"' EXIT
+            ARCHIVE="openssl-${OPENSSL_VERSION}.tar.gz"
+            curl -fL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/${ARCHIVE}" -o "$BUILD_DIR/$ARCHIVE"
+            echo "${OPENSSL_SHA256}  $BUILD_DIR/$ARCHIVE" | sha256sum -c -
+            tar -xzf "$BUILD_DIR/$ARCHIVE" -C "$BUILD_DIR"
+            (
+              cd "$BUILD_DIR/openssl-${OPENSSL_VERSION}"
+              ./Configure linux-x86_64 no-shared \
+                --prefix="$PREFIX" --openssldir="$PREFIX/ssl"
+              make -j$(nproc)
+              make install_sw
+            )
+          fi
+          ln -sf "$PREFIX/bin/openssl" /usr/local/bin/openssl
+          "$PREFIX/bin/openssl" version -a
+
       - name: Download installer
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
@@ -437,7 +572,9 @@ jobs:
           export ERL_TOP="$(pwd)"
           export MAKEFLAGS=-j$(($(nproc) + 2))
           eval `./otp_build env_win32 x64`
-          export PATH="$(pwd)/release/win32/bin:$PATH"
+          export PATH="$PWD/.cache/openssl-${OPENSSL_VERSION}/bin:$PWD/release/win32/bin:$PATH"
+          openssl version
+          erl.exe -noshell -eval 'Info = crypto:info(), io:format("crypto:info() = ~p~n", [Info]), #{cryptolib_version_compiled := Version, cryptolib_version_linked := Version} = Info, halt().'
           APP="${{ matrix.type }}"
           case "${APP}" in
             debug)
