@@ -71,11 +71,12 @@ jobs:
             ALL_APPS: ${{ steps.apps.outputs.all }}
             CHANGED_APPS: ${{ steps.app-changes.outputs.changes }}
         run: |
-          if ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-build-and-check') }} || ${{ github.event_name == 'schedule' }}; then
-              echo "changes=${ALL_APPS}" >> "$GITHUB_OUTPUT"
-          else
-              echo "changes=${CHANGED_APPS}" >> "$GITHUB_OUTPUT"
-          fi
+          ## This is a maintenance branch for a frozen OTP release, where the
+          ## point of CI is to show that the whole runtime still works rather
+          ## than only the applications touched by the last commit.  Always
+          ## test every application instead of just the changed ones.
+          echo "changes=${ALL_APPS}" >> "$GITHUB_OUTPUT"
+          echo "(changed applications were: ${CHANGED_APPS})"
       - name: Check if there are any C-code changes, if not then limit CI run
         uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # ratchet:dorny/paths-filter@v3.0.2
         id: c-code-changes
@@ -264,29 +265,70 @@ jobs:
       run:
         shell: wsl-bash {0}
     env:
+      # Published by https://github.com/slproweb/opensslhashes.
+      OPENSSL_SHA256: 5fe338c81d62515df7292f16542a0eef2a29db3efc023cd5a8c08ec3c97027ae
+      OPENSSL_VERSION: 3.5.9
       WXWIDGETS_VERSION: 3.2.6
     name: Build Erlang/OTP (Windows)
     runs-on: windows-2025
     needs: pack
     if: needs.pack.outputs.c-code-changes
+    outputs:
+      installer_name: ${{ steps.compile-erlang.outputs.installer_name }}
     steps:
       - uses: Vampire/setup-wsl@6a8db447be7ed35f2f499c02c6e60ff77ef11278 # v6.0.0
         with:
           distribution: Ubuntu-18.04
 
       - name: Install WSL dependencies
-        run: apt update && apt install -y g++-mingw-w64 gcc-mingw-w64 make autoconf unzip
+        run: apt update && apt install -y g++-mingw-w64 gcc-mingw-w64 make autoconf unzip zip
 
       - name: Install NSIS
         shell: cmd
         run: |
           choco install nsis --version 3.11.0
 
+      - name: Restore OpenSSL cache
+        id: openssl-cache
+        uses: actions/cache/restore@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: C:\OpenSSL-Win64
+          key: windows-openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-${{ runner.arch }}
+
       - name: Install openssl
-        shell: cmd
+        shell: powershell
         run: |
-          choco install openssl --version=3.1.1
-          IF EXIST "c:\\Program Files\\OpenSSL-Win64" (move "c:\\Program Files\\OpenSSL-Win64" "c:\\OpenSSL-Win64") ELSE (move "c:\\Program Files\\OpenSSL" "c:\\OpenSSL-Win64")
+          $marker = "C:\OpenSSL-Win64\.otp-ci-$($env:OPENSSL_SHA256)"
+          if (!(Test-Path $marker)) {
+            $version = $env:OPENSSL_VERSION.Replace('.', '_')
+            $installer = Join-Path $env:RUNNER_TEMP "Win64OpenSSL-$version.exe"
+            Invoke-WebRequest "https://slproweb.com/download/Win64OpenSSL-$version.exe" -OutFile $installer
+            $actualHash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualHash -ne $env:OPENSSL_SHA256) {
+              throw "OpenSSL installer hash mismatch: $actualHash"
+            }
+            Remove-Item C:\OpenSSL-Win64 -Recurse -Force -ErrorAction SilentlyContinue
+            $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/DIR=C:\OpenSSL-Win64')
+            $process = Start-Process $installer -ArgumentList $arguments -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+              throw "OpenSSL installer failed with exit code $($process.ExitCode)"
+            }
+            New-Item -ItemType File -Path $marker | Out-Null
+          }
+          $installedVersion = & C:\OpenSSL-Win64\bin\openssl.exe version
+          $expectedVersion = [regex]::Escape($env:OPENSSL_VERSION)
+          if ($installedVersion -notmatch "^OpenSSL $expectedVersion ") {
+            throw "Unexpected OpenSSL version: $installedVersion"
+          }
+          Get-Item C:\OpenSSL-Win64\include\openssl\opensslv.h | Out-Null
+          Get-Item C:\OpenSSL-Win64\lib\VC\x64\MD\libcrypto_static.lib | Out-Null
+
+      - name: Save OpenSSL cache
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: C:\OpenSSL-Win64
+          key: windows-openssl-${{ env.OPENSSL_VERSION }}-${{ env.OPENSSL_SHA256 }}-${{ runner.arch }}
 
       - name: Cache wxWidgets
         uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
@@ -327,7 +369,11 @@ jobs:
         shell: cmd
         run: |
           cd wxWidgets\\build\\msw
-          call "C:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\VC\Auxiliary\\Build\\vcvars64.bat"
+          SET VSWHERE="%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          FOR /F "delims=" %%P IN ('%VSWHERE% -latest -property installationPath') DO (
+            SET "VCVARSALL=%%P\VC\Auxiliary\Build\vcvarsall.bat"
+          )
+          call "%VCVARSALL%" x64
           nmake TARGET_CPU=amd64 BUILD=release SHARED=0 DIR_SUFFIX_CPU= -f makefile.vc
 
       - name: Download source archive
@@ -336,9 +382,12 @@ jobs:
           name: otp_prebuilt
 
       - name: Compile Erlang
+        id: compile-erlang
+        env:
+          WSLENV: GITHUB_OUTPUT/p
         run: |
-          mkdir -p /mnt/c/opt/local64/pgm/
-          cp -R wxWidgets /mnt/c/opt/local64/pgm/wxWidgets-${{ env.WXWIDGETS_VERSION }}
+          set -x
+          WXDIR="$PWD/wxWidgets"
           tar -xzf ./otp_src.tar.gz
           cd otp
           export PATH="/mnt/c/Program Files (x86)/NSIS/bin":$PATH
@@ -347,23 +396,294 @@ jobs:
           export ERLC_USE_SERVER=true
           export ERTS_SKIP_DEPEND=true
           eval `./otp_build env_win32 x64`
-          ./otp_build configure
+          ./otp_build configure --with-wxdir="$WXDIR" \
+             --with-ssl=/mnt/c/OpenSSL-Win64 --disable-dynamic-ssl-lib
+          if test -f lib/crypto/CONF_INFO; then
+            CRYPTO_CONF_INFO=$(tr -d '\r\n' < lib/crypto/CONF_INFO)
+            EXPECTED_CRYPTO_CONF_INFO='Static linking with OpenSSL 3.0 *MAY* require special configuring of the cryptolib.'
+            if test "$CRYPTO_CONF_INFO" != "$EXPECTED_CRYPTO_CONF_INFO"; then
+              cat lib/crypto/CONF_INFO
+              exit 1
+            fi
+          fi
           if cat erts/CONF_INFO ||
-             grep -v "Static linking with OpenSSL 3.0" lib/*/CONF_INFO ||
+             find lib -mindepth 2 -maxdepth 2 -name CONF_INFO \
+                  ! -path lib/crypto/CONF_INFO -size +0 -exec cat {} + | grep . ||
              cat lib/*/SKIP ||
              cat lib/SKIP-APPLICATIONS; then
              exit 1
           fi
+          grep -E '^(DYNAMIC_CRYPTO_LIB|SSL_LIBDIR|SSL_CRYPTO_LIBNAME|CRYPTO_LINK_LIB)' lib/crypto/c_src/win32/Makefile
           ./otp_build boot -a
+          CRYPTO_DLL=lib/crypto/priv/lib/win32/crypto.dll
+          test -f "$CRYPTO_DLL"
+          x86_64-w64-mingw32-objdump -p "$CRYPTO_DLL" | grep 'DLL Name'
+          if x86_64-w64-mingw32-objdump -p "$CRYPTO_DLL" |
+             grep -iE 'DLL Name:.*(libcrypto|libssl)'; then
+             echo "crypto.dll unexpectedly depends on a dynamic OpenSSL library" >&2
+             exit 1
+          fi
+          ./bin/erl.exe -noshell -eval 'Info = crypto:info(), io:format("crypto:info() = ~p~n", [Info]), #{cryptolib_version_compiled := Version, cryptolib_version_linked := Version} = Info, halt().'
           ./otp_build release -a
-          cp /mnt/c/opt/local64/pgm/wxWidgets-${{ env.WXWIDGETS_VERSION }}/3rdparty/webview2/runtimes/win-x64/native/WebView2Loader.dll $ERL_TOP/release/win32/erts-*/bin/
+          cp "$WXDIR/3rdparty/webview2/runtimes/win-x64/native/WebView2Loader.dll" $ERL_TOP/release/win32/erts-*/bin/
           ./otp_build installer_win32
+          echo "installer_name=$(ls release/win32/otp*.exe | xargs basename)" >> $GITHUB_OUTPUT
+          make release_tests
+          zip -q -r tests.zip release/tests
 
       - name: Upload installer
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: otp_win32_installer
           path: otp/release/win32/otp*.exe
+
+      - name: Upload tests
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: otp_tests
+          path: otp/tests.zip
+
+  build-wsl-openssl:
+    name: Build OpenSSL (WSL)
+    runs-on: windows-2025
+    needs: [pack, build-windows]
+    if: needs.pack.outputs.changes != '[]' && !startsWith(github.ref, 'refs/tags/OTP-')
+    env:
+      OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+      OPENSSL_VERSION: 3.5.9
+      WSLENV: OPENSSL_SHA256:OPENSSL_VERSION
+    defaults:
+      run:
+        shell: wsl-bash {0}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: Vampire/setup-wsl@6a8db447be7ed35f2f499c02c6e60ff77ef11278 # v6.0.0
+        with:
+          distribution: Ubuntu-18.04
+
+      - name: Cache WSL OpenSSL
+        id: openssl-cache
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: .cache/openssl-${{ env.OPENSSL_VERSION }}
+          key: wsl-openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build WSL OpenSSL
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        run: |
+          apt update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential curl perl
+          PREFIX="$PWD/.cache/openssl-${OPENSSL_VERSION}"
+          BUILD_DIR=$(mktemp -d)
+          trap 'rm -rf "$BUILD_DIR"' EXIT
+          ARCHIVE="openssl-${OPENSSL_VERSION}.tar.gz"
+          curl -fL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/${ARCHIVE}" -o "$BUILD_DIR/$ARCHIVE"
+          echo "${OPENSSL_SHA256}  $BUILD_DIR/$ARCHIVE" | sha256sum -c -
+          tar -xzf "$BUILD_DIR/$ARCHIVE" -C "$BUILD_DIR"
+          cd "$BUILD_DIR/openssl-${OPENSSL_VERSION}"
+          ./Configure linux-x86_64 no-shared \
+            --prefix="$PREFIX" --openssldir="$PREFIX/ssl"
+          make -j$(nproc)
+          make install_sw
+
+  test-windows:
+    name: Test Erlang/OTP (Windows)
+    runs-on: windows-2025
+    needs: [pack, build-windows, build-wsl-openssl]
+    if: needs.pack.outputs.changes != '[]' && !startsWith(github.ref, 'refs/tags/OTP-')
+    env:
+      OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+      OPENSSL_VERSION: 3.5.9
+      WSLENV: OPENSSL_SHA256:OPENSSL_VERSION
+    defaults:
+      run:
+        shell: wsl-bash {0}
+    strategy:
+      matrix:
+        type: ${{ fromJson(needs.pack.outputs.changes) }}
+      fail-fast: false
+    steps:
+      ## The test suites are checked out on the Windows side, so make sure
+      ## git does not rewrite the line endings for the WSL side.
+      - name: Setup nl behaviour for wsl
+        shell: cmd
+        run: git config --global core.autocrlf input
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set timezone
+        shell: cmd
+        run: tzutil /s "W. Europe Standard Time"
+
+      - uses: Vampire/setup-wsl@6a8db447be7ed35f2f499c02c6e60ff77ef11278 # v6.0.0
+        with:
+          distribution: Ubuntu-18.04
+
+      - name: Install WSL dependencies
+        run: apt update && apt install -y make autoconf unzip zip
+
+      - name: Cache WSL OpenSSL
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: .cache/openssl-${{ env.OPENSSL_VERSION }}
+          key: wsl-openssl-${{ env.OPENSSL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build WSL OpenSSL
+        run: |
+          PREFIX="$PWD/.cache/openssl-${OPENSSL_VERSION}"
+          if [ ! -x "$PREFIX/bin/openssl" ]; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential curl perl
+            BUILD_DIR=$(mktemp -d)
+            trap 'rm -rf "$BUILD_DIR"' EXIT
+            ARCHIVE="openssl-${OPENSSL_VERSION}.tar.gz"
+            curl -fL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/${ARCHIVE}" -o "$BUILD_DIR/$ARCHIVE"
+            echo "${OPENSSL_SHA256}  $BUILD_DIR/$ARCHIVE" | sha256sum -c -
+            tar -xzf "$BUILD_DIR/$ARCHIVE" -C "$BUILD_DIR"
+            (
+              cd "$BUILD_DIR/openssl-${OPENSSL_VERSION}"
+              ./Configure linux-x86_64 no-shared \
+                --prefix="$PREFIX" --openssldir="$PREFIX/ssl"
+              make -j$(nproc)
+              make install_sw
+            )
+          fi
+          ln -sf "$PREFIX/bin/openssl" /usr/local/bin/openssl
+          "$PREFIX/bin/openssl" version -a
+
+      - name: Download installer
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: otp_win32_installer
+
+      - name: Download tests
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: otp_tests
+
+      - name: Install Erlang/OTP
+        shell: cmd
+        run: |
+          start "" /WAIT ${{ needs.build-windows.outputs.installer_name }} /S /D=%CD%\release\win32\
+
+      - name: Run tests
+        run: |
+          unzip -q tests.zip
+          export ERL_TOP="$(pwd)"
+          export MAKEFLAGS=-j$(($(nproc) + 2))
+          eval `./otp_build env_win32 x64`
+          export PATH="$PWD/.cache/openssl-${OPENSSL_VERSION}/bin:$PWD/release/win32/bin:$PATH"
+          openssl version
+          erl.exe -noshell -eval 'Info = crypto:info(), io:format("crypto:info() = ~p~n", [Info]), #{cryptolib_version_compiled := Version, cryptolib_version_linked := Version} = Info, halt().'
+          APP="${{ matrix.type }}"
+          case "${APP}" in
+            debug)
+              echo "No debug tests on Windows"
+              ;;
+            *)
+              ## The Linux test job runs with SPEC_POSTFIX=gh, which makes
+              ## test_target_script.sh prefer <app>_gh.spec over <app>.spec when
+              ## one exists.  Do the same here so that the skips recorded in the
+              ## gh specs apply on Windows too.
+              if [ -f "release/tests/${APP}_test/${APP}_gh.spec" ]; then
+                RUN_TESTS="ts:run_category(${APP},gh,[batch])"
+              else
+                RUN_TESTS="ts:run(${APP},[batch])"
+              fi
+              (cd release/tests/test_server && \
+               erl.exe -noinput -eval "ts:install()" \
+                       -eval "${RUN_TESTS}" -s init stop)
+              if grep -l "^=result[ ]*failed:" \
+                 release/tests/test_server/ct_run.*/*${APP}*.logs/run*/suite.log; then
+                exit 1
+              fi
+              ;;
+          esac
+
+      - name: Package test results
+        if: ${{ !cancelled() && matrix.type != 'debug' }}
+        run: tar czf ${{ matrix.type }}_win32_test_results.tar.gz release/tests/test_server
+
+      - name: Upload test results
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: ${{ !cancelled() && matrix.type != 'debug' }}
+        with:
+          name: ${{ matrix.type }}_win32_test_results
+          path: ${{ matrix.type }}_win32_test_results.tar.gz
+
+  system-test-windows:
+    name: Test Erlang/OTP (system, Windows)
+    runs-on: windows-2025
+    needs: [pack, test-windows, build-windows]
+    if: ${{ !cancelled() && !startsWith(github.ref, 'refs/tags/OTP-') }}
+    defaults:
+      run:
+        shell: wsl-bash {0}
+    steps:
+      ## The test suites are checked out on the Windows side, so make sure
+      ## git does not rewrite the line endings for the WSL side.
+      - name: Setup nl behaviour for wsl
+        shell: cmd
+        run: git config --global core.autocrlf input
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set timezone
+        shell: cmd
+        run: tzutil /s "W. Europe Standard Time"
+
+      - uses: Vampire/setup-wsl@6a8db447be7ed35f2f499c02c6e60ff77ef11278 # v6.0.0
+        with:
+          distribution: Ubuntu-18.04
+
+      - name: Install WSL dependencies
+        run: apt update && apt install -y make autoconf unzip zip
+
+      - name: Download installer
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: otp_win32_installer
+
+      - name: Download tests
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: otp_tests
+
+      - name: Install Erlang/OTP
+        shell: cmd
+        run: |
+          start "" /WAIT ${{ needs.build-windows.outputs.installer_name }} /S /D=%CD%\release\win32\
+
+      - name: Run system tests
+        run: |
+          unzip -q tests.zip
+          export ERL_TOP="$(pwd)"
+          export MAKEFLAGS=-j$(($(nproc) + 2))
+          eval `./otp_build env_win32 x64`
+          export PATH="$(pwd)/release/win32/bin:$PATH"
+          if [ -f "release/tests/system_test/system_gh.spec" ]; then
+            RUN_TESTS="ts:run_category(system,gh,[batch])"
+          else
+            RUN_TESTS="ts:run(system,[batch])"
+          fi
+          (cd release/tests/test_server && \
+           erl.exe -noinput -eval "ts:install()" \
+                   -eval "${RUN_TESTS}" -s init stop)
+          if grep -l "^=result[ ]*failed:" \
+             release/tests/test_server/ct_run.*/*system*.logs/run*/suite.log; then
+            exit 1
+          fi
+
+      - name: Package test results
+        if: ${{ !cancelled() }}
+        run: tar czf system_win32_test_results.tar.gz release/tests/test_server
+
+      - name: Upload test results
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: ${{ !cancelled() }}
+        with:
+          name: system_win32_test_results
+          path: system_win32_test_results.tar.gz
 
   build-flavors:
     name: Build Erlang/OTP (Types and Flavors)
@@ -474,7 +794,7 @@ jobs:
     name: Test Erlang/OTP
     runs-on: ubuntu-latest
     needs: pack
-    if: needs.pack.outputs.changes != '[]'
+    if: needs.pack.outputs.changes != '[]' && !startsWith(github.ref, 'refs/tags/OTP-')
     strategy:
       matrix:
         # type: ${{ fromJson(needs.pack.outputs.all) }}
@@ -503,6 +823,7 @@ jobs:
           ! sudo apt remove systemd-coredump
           ## Removing systemd-coredump, caused apport to be installed instead, so we disable it
           ! sudo service apport stop
+          sudo sysctl -w dev.tty.legacy_tiocsti=1
           sudo bash -c "echo 'core.%p' > /proc/sys/kernel/core_pattern"
           docker run --ulimit core=-1 --ulimit nofile=5000:5000 --pids-limit 1024 \
             -e CTRUN_TIMEOUT=90 -e SPEC_POSTFIX=gh \
@@ -531,7 +852,7 @@ jobs:
   system-test:
     name: Test Erlang/OTP (system)
     runs-on: ubuntu-latest
-    if: ${{ !cancelled() }} # Run even if the need has failed
+    if: ${{ !cancelled() && !startsWith(github.ref, 'refs/tags/OTP-') }} # Run even if the need has failed
     needs: test
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -545,6 +866,12 @@ jobs:
           shopt -s nullglob
           mkdir -p make_test_dir
           for file in *_test_results/*.tar.gz; do
+            ## The Windows jobs upload <app>_win32_test_results artifacts, which
+            ## match the glob above but hold a release/tests tree rather than a
+            ## make_test_dir one.  They are handled by system-test-windows.
+            case "${file}" in
+              *_win32_test_results/*) continue ;;
+            esac
             tar xzf $file
           done
           docker run -v $PWD/make_test_dir:/buildroot/otp/erts/make_test_dir otp \
@@ -555,6 +882,7 @@ jobs:
           ! sudo apt remove systemd-coredump
           ## Removing systemd-coredump, caused apport to be installed instead, so we disable it
           ! sudo service apport stop
+          sudo sysctl -w dev.tty.legacy_tiocsti=1
           sudo bash -c "echo 'core.%p' > /proc/sys/kernel/core_pattern"
           docker run --ulimit core=-1 --ulimit nofile=5000:5000 --pids-limit 512 \
             -e CTRUN_TIMEOUT=90 -e SPEC_POSTFIX=gh \
@@ -591,8 +919,8 @@ jobs:
   release:
     name: Release Erlang/OTP
     runs-on: ubuntu-latest
-    needs: documentation
-    if: startsWith(github.ref, 'refs/tags/OTP-') && github.repository == 'erlang/otp'
+    needs: [documentation, build-windows]
+    if: startsWith(github.ref, 'refs/tags/OTP-')
     ## Needed to create releases
     permissions:
       contents: write
@@ -624,6 +952,11 @@ jobs:
         with:
           name: otp_doc_man
 
+      - name: Download windows installer
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: otp_win32_installer
+
       ## We add the correct version name into the file names
       ## and create the hash files for all assets
       - name: Create pre-build and doc archives
@@ -634,7 +967,7 @@ jobs:
         run: |
           shopt -s nullglob
           cd artifacts
-          FILES=$(ls {*.tar.gz,*.txt})
+          FILES=$(ls {*.tar.gz,*.txt,*.exe,*.openvex.json})
           md5sum $FILES > MD5.txt
           sha256sum $FILES > SHA256.txt
 
@@ -645,13 +978,10 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.txt
+            artifacts/*.exe
+            artifacts/*.openvex.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Deploy on erlang.org
-        env:
-          GITHUB_TOKEN: ${{ secrets.TRIGGER_ERLANG_ORG_BUILD }}
-        run: |
-          curl -H "Authorization: token ${GITHUB_TOKEN}" -X POST -H "Accept: application/vnd.github.v3+json" "https://api.github.com/repos/erlang/erlang-org/actions/workflows/update-gh-cache.yaml/dispatches" -d '{"ref":"master"}'
 
   event_file:
     name: "Event File"
