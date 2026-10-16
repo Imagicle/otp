@@ -65,18 +65,21 @@ push and pull request.
 | Tests | `Test Erlang/OTP (<app>)` per application on Linux; `Test Erlang/OTP (Windows) (<app>)` per application; system tests on both platforms |
 | Release | `Release Erlang/OTP`, tags only, depends on documentation and the Windows build |
 
-Test skips that are known to be safe go in the `<app>_gh.spec` files
+Test skips go in the `<app>_gh.spec` files
 (for example `lib/ssl/test/ssl_gh.spec`, `lib/kernel/test/kernel_gh.spec`);
 both platforms use them.
 
 ### Reading results
 
-Linux tests are expected to be green. Windows tests are unstable on GitHub
-runners, so a red run is not a verdict by itself. For each failing Windows
-application, download `<app>_win32_test_results` and compare its failing cases
-with the same application in the current baseline run listed in
-[IMAGICLE-STATUS.md](IMAGICLE-STATUS.md). Treat new failures, or failures in an
-application the change touches, as blockers.
+The Linux test jobs are the gate: they must be green. Linux results carry over
+to Windows for nearly all fixes.
+
+On Windows, the build and installer jobs must succeed. Windows test jobs are
+informational: the Windows test framework in OTP 26 is only partly fixed, and
+some suites (for example ssl and ssh) do not work at all, without the
+application being broken. Only the Windows tests of the application a change
+touches deserve a look, compared with the same application in the baseline run
+listed in [IMAGICLE-STATUS.md](IMAGICLE-STATUS.md).
 
 Because tag pushes skip tests, the only test evidence for a release is the
 branch run of the tagged commit. Never tag a commit without a reviewed branch
@@ -114,31 +117,83 @@ request into `imagicle-maint-26` and review the CI run.
 
 ### 3. Prepare and tag a release
 
+Choose the version following the Erlang/OTP convention:
+
+| Release content | OTP version | Example |
+|---|---|---|
+| Bug or security fixes | `100.0.<n>` | `100.0.1`, `100.0.2` |
+| New features | `100.<y>` | `100.1` |
+
+An application changed in a release takes that release's version (for example
+`erts-100.0.1` in `OTP-100.0.1`); unchanged applications keep their version.
+
 Follow the pattern of commit `4477e6f0 Prepare release`, in one commit on a
 topic branch:
 
 | File | Change |
 |---|---|
 | `OTP_VERSION` | New OTP version |
-| `<app path>/vsn.mk` | Version of each application changed since the last release (for example `erts/vsn.mk`, `lib/common_test/vsn.mk`) |
+| `<app path>/vsn.mk` | Version of each changed application (for example `erts/vsn.mk`, `lib/common_test/vsn.mk`) |
 | `<app path>/doc/src/notes.xml` | Release-notes section for each changed application, citing the OTP ticket and CVE |
 | `otp_versions.table` | New first line: `OTP-<vsn> : <changed app-vsn ...> # <unchanged app-vsn ...> :` |
-| `make/otp_version_tickets` | Tickets included in the release |
-| `openvex.table`, `otp-26.openvex.json` | VEX status of the CVEs fixed or affecting this release |
+| `make/otp_version_tickets` | Tickets included in the release. A leading `DEVELOPMENT` line only makes some tests auto-skip and may be omitted |
+| `openvex.table`, `otp-26.openvex.json` | VEX statements for the CVEs fixed in the release (see below) |
+
+#### Update the VEX files
+
+`openvex.table` is the append-only source; `otp-26.openvex.json` is generated
+from it with `vexctl` commands produced by upstream's
+`.github/scripts/otp-compliance.es`. The format and use cases are described in
+[HOWTO/SBOM.md](https://github.com/erlang/otp/blob/master/HOWTO/SBOM.md#vex).
+
+Constraints for the fork:
+
+- The script exists only on upstream `master`. Extract it to a temporary
+  directory; do not copy it into the working tree, where it would overwrite the
+  fork's `.github/scripts`.
+- It needs Erlang/OTP 27 or later to run (it uses `~"..."` sigils), plus
+  [`vexctl`](https://github.com/openvex/vexctl).
+- It reads `otp_versions.table` from the current directory, so run it from the
+  repository root after the new first line has been added.
+
+Append the statement under `"otp-26"` in `openvex.table`, for example:
+
+```json
+{
+  "pkg:otp/erts@14.0": "CVE-YYYY-NNNNN",
+  "status": {
+    "affected": "Update to any of the following versions: pkg:otp/erts@100.0.1",
+    "fixed": ["pkg:otp/erts@100.0.1"]
+  }
+}
+```
+
+Then generate the statements:
+
+```bash
+tmp=$(mktemp -d)
+git fetch upstream master
+git archive upstream/master .github/scripts | tar -x -C "$tmp"
+escript "$tmp/.github/scripts/otp-compliance.es" vex run --input-file openvex.table -b otp-26          # review the vexctl commands
+escript "$tmp/.github/scripts/otp-compliance.es" vex run --input-file openvex.table -b otp-26 | bash
+```
+
+#### Tag
 
 After the pull request is merged and its branch run has been reviewed:
 
 ```bash
 git switch imagicle-maint-26 && git pull --ff-only
-scripts/create-release-tag debug    # prints the tag annotation without tagging
-scripts/create-release-tag <branch>
+scripts/create-release-tag debug                  # prints the tag annotation without tagging
+scripts/create-release-tag backup/OTP-<vsn>
 git push origin OTP-<vsn>
 ```
 
 `create-release-tag` builds the annotated tag from the first line of
-`otp_versions.table` and then runs `git branch -f <branch>`, which moves
-`<branch>` to `HEAD`. It requires the argument and fails when `<branch>` is the
-checked-out branch.
+`otp_versions.table`, then creates a local backup branch named by its argument
+at `HEAD` (`git branch -f <name>`). The backup branch is not needed by the
+fork; delete it with `git branch -D backup/OTP-<vsn>`. The argument must not be
+the checked-out branch.
 
 Pushing the tag runs the release job, which publishes GitHub Release
 `OTP <vsn>` with `otp_src_<vsn>.tar.gz`, `otp_doc_html_<vsn>.tar.gz`,
@@ -152,5 +207,5 @@ Pushing the tag runs the release job, which publishes GitHub Release
 | `Build Erlang/OTP (Windows)` fails at "Build wxWidgets" | The branch does not contain the fork's workflow and uses upstream's hard-coded Visual Studio 2022 Enterprise path | Branch from `imagicle-maint-26` |
 | All `Test Erlang/OTP` jobs skipped on a branch push | The branch runs the upstream workflow, which tests only changed applications | Branch from `imagicle-maint-26` |
 | Tests skipped on a tag run | By design | Review the branch run of the tagged commit |
-| Windows test application red | Usually runner instability | Compare with the baseline run (see Reading results) |
+| Windows test application red | Incomplete Windows test framework or runner instability | Informational; check only the application the change touches (see Reading results) |
 | Windows build fails on OpenSSL version or hash | `OPENSSL_VERSION` / `OPENSSL_SHA256` no longer match the published installer | Update both values in `main.yaml` from <https://github.com/slproweb/opensslhashes> |
